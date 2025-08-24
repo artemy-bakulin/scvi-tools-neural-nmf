@@ -14,6 +14,42 @@ def _identity(x):
     return x
 
 
+class PositiveLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, std=0.1, mean=-0.5):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * std + mean)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        weight = torch.nn.functional.softplus(self.weight)
+        if self.bias is not None:
+            return torch.nn.functional.linear(x, weight, self.bias)
+        return torch.nn.functional.linear(x, weight)
+
+
+class DualLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, num_covariates=0):
+        super().__init__()
+        self.X_layer = PositiveLinear(
+            in_features,
+            out_features,
+            bias=bias,
+        )
+        self.covariate_layer = nn.Linear(num_covariates, out_features, bias=bias)
+        self.in_features = in_features
+        self.num_covariates = num_covariates
+
+    def forward(self, x):
+        x, covariates = x[:, : self.in_features], x[:, self.in_features :]
+        x = self.X_layer(x)
+        covariates = self.covariate_layer(covariates)
+        return x + covariates
+
+
 class FCLayers(nn.Module):
     """A helper class to build fully-connected layers for a neural network.
 
@@ -64,6 +100,7 @@ class FCLayers(nn.Module):
         bias: bool = True,
         inject_covariates: bool = True,
         activation_fn: nn.Module = nn.ReLU,
+        weights_positive: bool = False,
     ):
         super().__init__()
         self.inject_covariates = inject_covariates
@@ -76,36 +113,32 @@ class FCLayers(nn.Module):
             self.n_cat_list = []
 
         self.n_cov = n_cont + sum(self.n_cat_list)
+        self.weights_positive = weights_positive
 
-        self.fc_layers = nn.Sequential(
-            collections.OrderedDict(
-                [
-                    (
-                        f"Layer {i}",
-                        nn.Sequential(
-                            nn.Linear(
-                                n_in + self.n_cov * self.inject_into_layer(i),
-                                n_out,
-                                bias=bias,
-                            ),
-                            # non-default params come from defaults in original Tensorflow
-                            # implementation
-                            nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001)
-                            if use_batch_norm
-                            else None,
-                            nn.LayerNorm(n_out, elementwise_affine=False)
-                            if use_layer_norm
-                            else None,
-                            activation_fn() if use_activation else None,
-                            nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
-                        ),
-                    )
-                    for i, (n_in, n_out) in enumerate(
-                        zip(layers_dim[:-1], layers_dim[1:], strict=True)
-                    )
-                ]
-            )
-        )
+        layers = collections.OrderedDict()
+        for i, (n_in, n_out) in enumerate(zip(layers_dim[:-1], layers_dim[1:], strict=True)):
+
+            if weights_positive:
+                linear = DualLinear(n_in, n_out, bias=bias, num_covariates=self.n_cov)
+            else:
+                linear = nn.Linear(n_in + self.n_cov * self.inject_into_layer(i), n_out, bias=bias)
+            layer_modules = [linear]
+
+            # Add normalization layers if specified
+            if use_batch_norm:
+                layer_modules.append(nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001))
+            elif use_layer_norm:
+                layer_modules.append(nn.LayerNorm(n_out, elementwise_affine=False))
+
+            # Add activation and dropout if specified
+            if use_activation:
+                layer_modules.append(activation_fn())
+            if dropout_rate > 0:
+                layer_modules.append(nn.Dropout(p=dropout_rate))
+
+            layers[f"Layer {i}"] = nn.Sequential(*layer_modules)
+
+        self.fc_layers = nn.Sequential(layers)
 
     def inject_into_layer(self, layer_num) -> bool:
         """Helper to determine if covariates should be injected."""
@@ -177,28 +210,26 @@ class FCLayers(nn.Module):
                 if layer is not None:
                     if isinstance(layer, nn.BatchNorm1d):
                         if x.dim() == 3:
-                            if (
-                                x.device.type == "mps"
-                            ):  # TODO: remove this when MPS supports for loop.
-                                x = torch.cat(
-                                    [(layer(slice_x.clone())).unsqueeze(0) for slice_x in x], dim=0
-                                )
+                            if x.device.type == "mps":  # TODO: remove this when MPS supports for loop.
+                                x = torch.cat([(layer(slice_x.clone())).unsqueeze(0) for slice_x in x], dim=0)
                             else:
-                                x = torch.cat(
-                                    [layer(slice_x).unsqueeze(0) for slice_x in x], dim=0
-                                )
+                                x = torch.cat([layer(slice_x).unsqueeze(0) for slice_x in x], dim=0)
                         else:
                             x = layer(x)
                     else:
-                        if isinstance(layer, nn.Linear) and self.inject_into_layer(i):
+                        if (isinstance(layer, nn.Linear) or isinstance(layer, DualLinear)) and self.inject_into_layer(
+                            i
+                        ):
                             if x.dim() == 3:
                                 cov_list_layer = [
-                                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1)))
-                                    for o in cov_list
+                                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1))) for o in cov_list
                                 ]
                             else:
                                 cov_list_layer = cov_list
+                            if self.weights_positive and isinstance(layer, PositiveLinear):
+                                x = torch.nn.functional.softplus(x)
                             x = torch.cat((x, *cov_list_layer), dim=-1)
+
                         x = layer(x)
         return x
 
@@ -904,10 +935,7 @@ class DecoderTOTALVI(nn.Module):
         py_back_cat_z = torch.cat([py_back, z], dim=-1)
 
         py_["back_alpha"] = self.py_back_mean_log_alpha(py_back_cat_z, *cat_list)
-        py_["back_beta"] = (
-            self.activation_function_bg(self.py_back_mean_log_beta(py_back_cat_z, *cat_list))
-            + 1e-8
-        )
+        py_["back_beta"] = self.activation_function_bg(self.py_back_mean_log_beta(py_back_cat_z, *cat_list)) + 1e-8
         log_pro_back_mean = Normal(py_["back_alpha"], py_["back_beta"]).rsample()
         py_["rate_back"] = torch.exp(log_pro_back_mean)
 
@@ -922,9 +950,7 @@ class DecoderTOTALVI(nn.Module):
         py_["mixing"] = self.py_background_decoder(p_mixing_cat_z, *cat_list)
 
         protein_mixing = 1 / (1 + torch.exp(-py_["mixing"]))
-        py_["scale"] = torch.nn.functional.normalize(
-            (1 - protein_mixing) * py_["rate_fore"], p=1, dim=-1
-        )
+        py_["scale"] = torch.nn.functional.normalize((1 - protein_mixing) * py_["rate_fore"], p=1, dim=-1)
 
         return (px_, py_, log_pro_back_mean)
 

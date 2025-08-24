@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import warnings
 from typing import TYPE_CHECKING
+import math
 
 import numpy as np
 import torch
@@ -120,8 +121,6 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
     use_observed_lib_size
         If ``True``, use the observed library size for RNA as the scaling factor in the mean of the
         conditional distribution.
-    extra_payload_autotune
-        If ``True``, will return extra matrices in the loss output to be used during autotune
     library_log_means
         :class:`~numpy.ndarray` of shape ``(1, n_batch)`` of means of the log library sizes that
         parameterize the prior on library size if ``use_size_factor_key`` is ``False`` and
@@ -141,6 +140,9 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         Keyword arguments passed into :class:`~scvi.nn.Embedding` if ``batch_representation`` is
         set to ``"embedding"``.
 
+    Notes
+    -----
+    Lifecycle: argument ``batch_representation`` is experimental in v1.2.
     """
 
     def __init__(
@@ -156,7 +158,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         dropout_rate: float = 0.1,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         log_variational: bool = True,
-        gene_likelihood: Literal["zinb", "nb", "poisson", "normal"] = "zinb",
+        gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         latent_distribution: Literal["normal", "ln"] = "normal",
         encode_covariates: bool = False,
         deeply_inject_covariates: bool = True,
@@ -165,7 +167,6 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_size_factor_key: bool = False,
         use_observed_lib_size: bool = True,
-        extra_payload_autotune: bool = False,
         library_log_means: np.ndarray | None = None,
         library_log_vars: np.ndarray | None = None,
         var_activation: Callable[[torch.Tensor], torch.Tensor] = None,
@@ -187,13 +188,11 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         self.encode_covariates = encode_covariates
         self.use_size_factor_key = use_size_factor_key
         self.use_observed_lib_size = use_size_factor_key or use_observed_lib_size
-        self.extra_payload_autotune = extra_payload_autotune
 
         if not self.use_observed_lib_size:
             if library_log_means is None or library_log_vars is None:
                 raise ValueError(
-                    "If not using observed_lib_size, "
-                    "must provide library_log_means and library_log_vars."
+                    "If not using observed_lib_size, " "must provide library_log_means and library_log_vars."
                 )
 
             self.register_buffer("library_log_means", torch.from_numpy(library_log_means).float())
@@ -208,9 +207,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         elif self.dispersion == "gene-cell":
             pass
         else:
-            raise ValueError(
-                "`dispersion` must be one of 'gene', 'gene-batch', 'gene-label', 'gene-cell'."
-            )
+            raise ValueError("`dispersion` must be one of 'gene', 'gene-batch', 'gene-label', 'gene-cell'.")
 
         self.batch_representation = batch_representation
         if self.batch_representation == "embedding":
@@ -344,13 +341,9 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         from torch.nn.functional import linear
 
         n_batch = self.library_log_means.shape[1]
-        local_library_log_means = linear(
-            one_hot(batch_index.squeeze(-1), n_batch).float(), self.library_log_means
-        )
+        local_library_log_means = linear(one_hot(batch_index.squeeze(-1), n_batch).float(), self.library_log_means)
 
-        local_library_log_vars = linear(
-            one_hot(batch_index.squeeze(-1), n_batch).float(), self.library_log_vars
-        )
+        local_library_log_vars = linear(one_hot(batch_index.squeeze(-1), n_batch).float(), self.library_log_vars)
 
         return local_library_log_means, local_library_log_vars
 
@@ -391,18 +384,14 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
             if self.batch_representation == "embedding":
                 ql, library_encoded = self.l_encoder(encoder_input, *categorical_input)
             else:
-                ql, library_encoded = self.l_encoder(
-                    encoder_input, batch_index, *categorical_input
-                )
+                ql, library_encoded = self.l_encoder(encoder_input, batch_index, *categorical_input)
             library = library_encoded
 
         if n_samples > 1:
             untran_z = qz.sample((n_samples,))
             z = self.z_encoder.z_transformation(untran_z)
             if self.use_observed_lib_size:
-                library = library.unsqueeze(0).expand(
-                    (n_samples, library.size(0), library.size(1))
-                )
+                library = library.unsqueeze(0).expand((n_samples, library.size(0), library.size(1)))
             else:
                 library = ql.sample((n_samples,))
 
@@ -466,9 +455,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         if cont_covs is None:
             decoder_input = z
         elif z.dim() != cont_covs.dim():
-            decoder_input = torch.cat(
-                [z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1
-            )
+            decoder_input = torch.cat([z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1)
         else:
             decoder_input = torch.cat([z, cont_covs], dim=-1)
 
@@ -536,7 +523,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
                 local_library_log_means,
                 local_library_log_vars,
             ) = self._compute_local_library_params(batch_index)
-            pl = Normal(local_library_log_means, local_library_log_vars.sqrt())
+            pl = Normal(local_library_log_means, local_library_log_vars.sqrt() + 1e-3)
         pz = Normal(torch.zeros_like(z), torch.ones_like(z))
 
         return {
@@ -576,16 +563,6 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
 
         loss = torch.mean(reconst_loss + weighted_kl_local)
 
-        # a payload to be used during autotune
-        if self.extra_payload_autotune:
-            extra_metrics_payload = {
-                "z": inference_outputs["z"],
-                "batch": tensors[REGISTRY_KEYS.BATCH_KEY],
-                "labels": tensors[REGISTRY_KEYS.LABELS_KEY],
-            }
-        else:
-            extra_metrics_payload = {}
-
         return LossOutput(
             loss=loss,
             reconstruction_loss=reconst_loss,
@@ -593,7 +570,11 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
                 MODULE_KEYS.KL_L_KEY: kl_divergence_l,
                 MODULE_KEYS.KL_Z_KEY: kl_divergence_z,
             },
-            extra_metrics=extra_metrics_payload,
+            extra_metrics={
+                "z": inference_outputs["z"],
+                "batch": tensors[REGISTRY_KEYS.BATCH_KEY],
+                "labels": tensors[REGISTRY_KEYS.LABELS_KEY],
+            },
         )
 
     @torch.inference_mode()
@@ -602,7 +583,6 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         tensors: dict[str, torch.Tensor],
         n_samples: int = 1,
         max_poisson_rate: float = 1e8,
-        generative_kwargs: dict | None = None,
     ) -> torch.Tensor:
         r"""Generate predictive samples from the posterior predictive distribution.
 
@@ -623,8 +603,6 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
             The maximum value to which to clip the ``rate`` parameter of
             :class:`~scvi.distributions.Poisson`. Avoids numerical sampling issues when the
             parameter is very large due to the variance of the distribution.
-        generative_kwargs
-            Keyword args for ``generative()`` in fwd pass
 
         Returns
         -------
@@ -634,12 +612,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         from scvi.distributions import Poisson
 
         inference_kwargs = {"n_samples": n_samples}
-        _, generative_outputs = self.forward(
-            tensors,
-            inference_kwargs=inference_kwargs,
-            generative_kwargs=generative_kwargs,
-            compute_loss=False,
-        )
+        _, generative_outputs = self.forward(tensors, inference_kwargs=inference_kwargs, compute_loss=False)
 
         dist = generative_outputs[MODULE_KEYS.PX_KEY]
         if self.gene_likelihood == "poisson":
@@ -687,8 +660,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
         to_sum = []
         if n_mc_samples_per_pass > n_mc_samples:
             warnings.warn(
-                "Number of chunks is larger than the total number of samples, setting it to the "
-                "number of samples",
+                "Number of chunks is larger than the total number of samples, setting it to the " "number of samples",
                 RuntimeWarning,
                 stacklevel=settings.warnings_stacklevel,
             )
@@ -710,9 +682,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
             reconst_loss = losses.dict_sum(losses.reconstruction_loss)
 
             # Log-probabilities
-            p_z = (
-                Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale)).log_prob(z).sum(dim=-1)
-            )
+            p_z = Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale)).log_prob(z).sum(dim=-1)
             p_x_zl = -reconst_loss
             q_z_x = qz.log_prob(z).sum(dim=-1)
             log_prob_sum = p_z + p_x_zl - q_z_x
@@ -723,11 +693,7 @@ class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
                     local_library_log_vars,
                 ) = self._compute_local_library_params(batch_index)
 
-                p_l = (
-                    Normal(local_library_log_means, local_library_log_vars.sqrt())
-                    .log_prob(library)
-                    .sum(dim=-1)
-                )
+                p_l = Normal(local_library_log_means, local_library_log_vars.sqrt()).log_prob(library).sum(dim=-1)
                 q_l_x = ql.log_prob(library).sum(dim=-1)
 
                 log_prob_sum += p_l - q_l_x
@@ -757,6 +723,8 @@ class LDVAE(VAE):
     inspect which genes contribute to variation in the dataset. It may also be used
     for all scVI tasks, like differential expression, batch correction, imputation, etc.
     However, batch correction may be less powerful as it assumes a linear model.
+
+    We also add functionality to perform neural NMF, when weights_positive is set to ``True``.
 
     Parameters
     ----------
@@ -800,6 +768,16 @@ class LDVAE(VAE):
         * ``'ln'`` - Logistic normal with normal params N(0, 1)
     use_observed_lib_size
         Use observed library size for RNA as scaling factor in mean of conditional distribution.
+    weights_positive
+        If ``True``, weights in the linear decoder are constrained to be positive.
+    decorrelation_loss_weight
+        Weight for the decorrelation loss, which encourages ldvae loadings to be decorrelated. Default is 120.
+    min_cor
+        Minimum correlation for the decorrelation loss. If set to a positive value, the decorrelation loss
+        will only be applied if the correlation between loadings is above this value. This can help
+        avoid over-penalizing loadings that are already well-separated.
+
+
     **kwargs
     """
 
@@ -819,6 +797,9 @@ class LDVAE(VAE):
         bias: bool = False,
         latent_distribution: str = "normal",
         use_observed_lib_size: bool = False,
+        weights_positive: bool = False,
+        decorrelation_loss_weight=120,
+        min_cor=0,
         **kwargs,
     ):
         from scvi.nn import Encoder, LinearDecoderSCVI
@@ -867,14 +848,20 @@ class LDVAE(VAE):
             use_batch_norm=use_batch_norm,
             use_layer_norm=False,
             bias=bias,
+            weights_positive=weights_positive,
         )
+        self.weights_positive = weights_positive
+        self.decorrelation_loss_weight = decorrelation_loss_weight
+        self.min_cor = min_cor
 
     @torch.inference_mode()
     def get_loadings(self) -> np.ndarray:
         """Extract per-gene weights in the linear decoder."""
         # This is BW, where B is diag(b) batch norm, W is weight matrix
         if self.use_batch_norm is True:
-            w = self.decoder.factor_regressor.fc_layers[0][0].weight
+            w = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
+            if self.weights_positive:
+                w = torch.nn.functional.softplus(w)
             bn = self.decoder.factor_regressor.fc_layers[0][1]
             sigma = torch.sqrt(bn.running_var + bn.eps)
             gamma = bn.weight
@@ -882,9 +869,61 @@ class LDVAE(VAE):
             b_identity = torch.diag(b)
             loadings = torch.matmul(b_identity, w)
         else:
-            loadings = self.decoder.factor_regressor.fc_layers[0][0].weight
+            loadings = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
+            if self.weights_positive:
+                loadings = torch.nn.functional.softplus(loadings)
+
         loadings = loadings.detach().cpu().numpy()
-        if self.n_batch > 1:
-            loadings = loadings[:, : -self.n_batch]
+        # if self.n_batch > 1:
+        #     loadings = loadings[:, : -self.n_batch]
 
         return loadings
+
+    # def row_distribution_kl(self, W, eps=1e-8):
+    #     row_sums = W.sum(dim=1)
+    #     p = row_sums / row_sums.sum().clamp(min=eps)
+    #     log_p = torch.log(p + eps)
+    #     entropy = -torch.sum(p * log_p)
+    #     k = W.shape[0]
+    #     kl = math.log(k) - entropy
+    #     return kl
+
+    # def row_min_max_ratio(self, W, eps=1e-8):
+    #     row_sums = W.sum(dim=1)
+    #     min_row_sum = row_sums.min().clamp(min=eps)
+    #     max_row_sum = row_sums.max().clamp(min=eps)
+    #     ratio = max_row_sum / min_row_sum - 1
+    #     return ratio
+
+    def row_min_max_ratio(self, W, threshold=0.5, scale=20.0, eps=1e-6):
+        # Sigmoid approximates the step function
+        W_threshold = torch.quantile(W, threshold)  # .detach()
+        support_prob = torch.sigmoid(scale * (W - W_threshold))  # shape: [n_rows, n_cols]
+        support_soft_counts = support_prob.sum(dim=1)  # [n_rows]
+
+        min_support = support_soft_counts.min().clamp(min=eps)
+        max_support = support_soft_counts.max().clamp(min=eps)
+
+        return (max_support / min_support) - 1
+
+    def decorrelation_loss(self, W):
+        # row_sum_loss = self.row_min_max_ratio(W.T, eps=1e-8)
+        W_normalized = torch.nn.functional.normalize(W, p=2, dim=1)
+        gram = W_normalized @ W_normalized.T
+        off_diag = gram - torch.eye(gram.shape[0], device=W.device)
+        cor_loss = (off_diag**2).mean()
+
+        cor_loss = torch.clamp(cor_loss, min=self.min_cor)
+        # row_sum_loss = torch.clamp(row_sum_loss, min=0.3)
+        return cor_loss  # + row_sum_loss * 1e-2
+
+    def loss(self, *args, **kwargs):
+        loss_output = super().loss(*args, **kwargs)
+        if self.decorrelation_loss_weight != 0:
+            w = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
+            if self.weights_positive:
+                w = torch.nn.functional.softplus(w)
+            decor_loss = self.decorrelation_loss(w)
+
+            object.__setattr__(loss_output, "loss", loss_output.loss + decor_loss * self.decorrelation_loss_weight)
+        return loss_output
