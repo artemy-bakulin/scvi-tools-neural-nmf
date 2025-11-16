@@ -859,9 +859,11 @@ class LDVAE(VAE):
         """Extract per-gene weights in the linear decoder."""
         # This is BW, where B is diag(b) batch norm, W is weight matrix
         if self.use_batch_norm is True:
-            w = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
             if self.weights_positive:
+                w = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
                 w = torch.nn.functional.softplus(w)
+            else:
+                w = self.decoder.factor_regressor.fc_layers[0][0].weight
             bn = self.decoder.factor_regressor.fc_layers[0][1]
             sigma = torch.sqrt(bn.running_var + bn.eps)
             gamma = bn.weight
@@ -869,9 +871,11 @@ class LDVAE(VAE):
             b_identity = torch.diag(b)
             loadings = torch.matmul(b_identity, w)
         else:
-            loadings = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
             if self.weights_positive:
+                loadings = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
                 loadings = torch.nn.functional.softplus(loadings)
+            else:
+                loadings = self.decoder.factor_regressor.fc_layers[0][0].weight
 
         loadings = loadings.detach().cpu().numpy()
         # if self.n_batch > 1:
@@ -919,7 +923,7 @@ class LDVAE(VAE):
 
     def loss(self, *args, **kwargs):
         loss_output = super().loss(*args, **kwargs)
-        if self.decorrelation_loss_weight != 0:
+        if self.decorrelation_loss_weight != 0 and self.weights_positive:
             w = self.decoder.factor_regressor.fc_layers[0][0].X_layer.weight
             if self.weights_positive:
                 w = torch.nn.functional.softplus(w)
